@@ -1,0 +1,19 @@
+{application, cluster,
+ [
+  {description, ""},
+  {vsn, "1.0.0"},
+  {registered, [cluster]},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  lager,
+                  mnesia,
+                  notify
+                 ]},
+  {mod, { cluster_app, []}},
+  {env, [
+         {role, master},
+         {masters, []},
+         {tables, []}
+        ]}
+ ]}.
