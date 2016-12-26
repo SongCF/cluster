@@ -13,4 +13,5 @@ start(_StartType, _StartArgs) ->
     cluster_sup:start_link().
 
 stop(_State) ->
+    cluster:leader_select_leave(),
     ok.

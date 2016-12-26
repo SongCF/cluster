@@ -23,6 +23,11 @@ start_link() ->
 %% -------------------------------------------------------------------
 
 init([]) ->
-    Spec = ?CHILD(cluster, worker),
-    {ok, { {one_for_one, 5, 10}, [ Spec ]} }.
+    SlaCluster={cluster,
+                {cluster, start_link, []},
+                permanent,
+                infinity,
+                worker,
+                [cluster]},
+    {ok, { {one_for_one, 5, 10}, [ SlaCluster]} }.
 

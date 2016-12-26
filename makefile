@@ -8,7 +8,7 @@ deps:
 
 
 # 获取依赖
-updeps:
+udeps:
 	rebar update-deps
 
 # 清楚

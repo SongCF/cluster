@@ -7,13 +7,11 @@
                   kernel,
                   stdlib,
                   lager,
+                  framework,
                   mnesia,
-                  notify
+                  notify,
+                  inets
                  ]},
   {mod, { cluster_app, []}},
-  {env, [
-         {role, master},
-         {masters, []},
-         {tables, []}
-        ]}
+  {env, []}
  ]}.

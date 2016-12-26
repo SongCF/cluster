@@ -1,3 +1,9 @@
+%%%-------------------------------------------------------------------
+%%% @author zhuoyikang <>
+%%% @doc
+%%% vc cluster
+%%% @end
+%%%-------------------------------------------------------------------
 -module(cluster).
 
 -behaviour(gen_server).
@@ -7,7 +13,6 @@
          start/0,
          init_table/2,
          init_table/3,
-         config_master/0,
          copy_table/1,
          role_list/1,
          node_role/1,
@@ -17,8 +22,10 @@
          random_node/1,
          random_pid/2,
          wait_all/0,
-         get_my_role/0
+         get_my_role/0,
+         leader_select_leave/0
         ]).
+-export([leader_select_update/0]).
 
 -export([del_object/2]).
 -export([del_proc/2]).
@@ -30,10 +37,19 @@
          terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
--record(cluster, {role, node}).
+-define(LEADER_SELECT, <<"leaderselect">>).
+-define(NODE_NAME, <<"node">>).
+-define(MAX_MGR_NUM, <<"max_mgr">>).
+-define(ROLE, <<"role">>).
+-define(LEADER, <<"leader">>).
+-define(ERR_CODE, <<"code">>).
+-define(RSP_DATA, <<"response">>).
+-define(MGR_LIST, <<"mgr_list">>).
 
+-record(cluster, {role, node}).
 -record(state, {}).
 
+-include("logger.hrl").
 
 %%%-------------------------------------------------------------------
 %%% API
@@ -43,7 +59,12 @@ start() ->
     application:ensure_all_started(cluster).
 
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    %% get leader, and check self role from remote
+    {Role, Leader, MgrList} = leader_select_join(),
+    set_my_role(Role),
+    set_masters(MgrList),
+    %% start
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Role, Leader, MgrList], []).
 
 %% master调用，拷贝或者初始化指定的表.
 init_table(Table, Schema) ->
@@ -95,7 +116,6 @@ node_role(Node) ->
         _ -> undefined
     end.
 
-
 %% 返回集群中所有的节点
 all_node() ->
     NodeRecord = #cluster{role = '$1', node = '$2'},
@@ -136,17 +156,12 @@ get_proc(Table, Key) ->
 %%% gen_server callbacks
 %%%-------------------------------------------------------------------
 
-init([]) ->
-    {ok, Role} = application:get_env(cluster, role),
-    DecideRole = decide_role(Role),
-    set_my_role(DecideRole),
-    lager:info("decide role ~p", [DecideRole]),
-
-    {ok, MasterNodes} = config_master(),
-    Tables1 = role_tables(),
-    do_init(MasterNodes, DecideRole, Tables1),
+init([Role, _Leader, MgrList]) ->
+    lager:info("decide role ~p", [Role]),
+    Tables = config_tables(),
+    MasterNodes = MgrList,
+    do_init(MasterNodes, Role, Tables),
     {ok, #state{}}.
-
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -173,7 +188,10 @@ handle_info({nodedown, Node}, State) ->
     %% 删除老的数据.
     node_down(node_role(Node), Node),
     case get_my_role() of
-        leader -> notify:post(nodedown, Node);
+        leader ->
+            notify:post(nodedown, Node),
+            %% 更新leader_selection
+            leader_select_update();
         _ -> ignore
     end,
     {noreply, State};
@@ -190,26 +208,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%%-------------------------------------------------------------------
 %%% Internal functions
 %%%-------------------------------------------------------------------
-
-%% 实际的role，以配置Role为参数.
-decide_role(master) ->
-    {ok, MasterNodes} = config_master(),
-    MasterNodes2 = MasterNodes -- [node()],
-    %% 其他master都链接不上，说明自己是第一个启动的master。
-    AmIFirstMaster =
-        lists:all(fun(Node) ->
-                    case net_kernel:connect_node(Node) of
-                        true -> false;
-                        _ -> true
-                    end
-                  end, MasterNodes2),
-    case AmIFirstMaster of
-        true -> leader;
-        false -> master
-    end;
-decide_role(RoleCfg) ->
-    RoleCfg.
-
 
 %% leader的初始化，检查配置里面的表是不是被建立了，是则copy到本地，没有则建立.
 do_init(_MasterNodes, leader, _) ->
@@ -237,10 +235,10 @@ do_init(MasterNodes, _Role, Tables) ->
 
 
 cast_all_master(Msg) ->
-    {ok, MasterNodes} = config_master(),
+    {ok, MasterNodes} = get_masters(),
     [gen_server:cast({cluster, Node}, Msg) || Node <- MasterNodes].
 
-role_tables() ->
+config_tables() ->
     {ok, Tables1} = application:get_env(cluster, tables),
     [cluster] ++ Tables1.
 
@@ -269,7 +267,8 @@ node_down(Role, Node) ->
             %% 使用事务来避免争用.
             mnesia:transaction(TransFun);
         _ ->  mnesia:dirty_delete_object(Info)
-    end.
+    end,
+    ok.
 
 
 %% 清除Table中所有的Node项目。
@@ -297,10 +296,61 @@ random_pid(TableName, Attrs) ->
     lists:nth(No, PidList).
 
 
-%% 返回配置表中的master
-config_master() ->
-    Ret = {ok, _Masters} = application:get_env(cluster, masters),
-    Ret.
+leader_select_join()->
+    {ok, HostStr} = application:get_env(cluster, selection_host),
+    {ok, AppId} = application:get_env(cluster, app_id),
+    Node = atom_to_list(node()),
+    % http://127.0.0.1:10001
+    Url = lists:concat(["http://", HostStr, "/api/v1/",
+        binary_to_list(?LEADER_SELECT), "/", AppId, "/", Node,
+        "?", binary_to_list(?MAX_MGR_NUM), "=", "7"
+    ]),
+    {ok, {_,_,Rsp}} = httpc:request(post, {Url, [], [], []}, [{timeout, 5000}], []),
+    RspMap = json:decode(list_to_binary(Rsp),[return_maps]),
+    #{?ERR_CODE := 0, ?RSP_DATA := #{
+        ?LEADER := LeaderNode,
+        ?ROLE := SelfRole,
+        ?MGR_LIST := MgrBinList
+    }} = RspMap,
+    Role = binary_to_existing_atom(SelfRole,utf8),
+    Leader = binary_to_atom(LeaderNode,utf8),
+    MgrList = [binary_to_atom(TmpMgr, utf8) || TmpMgr <- MgrBinList],
+    io:format("Role = ~p, name = ~p~n", [Role, node()]),
+    io:format("Leader = ~p~n", [Leader]),
+    io:format("MgrList = ~p~n", [MgrList]),
+    {Role, Leader, MgrList}.
+
+leader_select_leave()->
+    {ok, HostStr} = application:get_env(cluster, selection_host),
+    {ok, AppId} = application:get_env(cluster, app_id),
+    Node = atom_to_list(node()),
+    Url = lists:concat(["http://", HostStr, "/api/v1/",
+        binary_to_list(?LEADER_SELECT), "/", AppId, "/", Node
+    ]),
+    {ok, {_,_,Rsp}} = httpc:request(delete, {Url, []}, [{timeout, 5000}], []),
+    RspMap = json:decode(list_to_binary(Rsp),[return_maps]),
+    io:format("leader_select_leave = ~p~n", [RspMap]),
+    %#{?ERR_CODE := 0} = RspMap,
+    ok.
+
+leader_select_update()->
+    {ok, HostStr} = application:get_env(cluster, selection_host),
+    {ok, AppId} = application:get_env(cluster, app_id),
+    [Leader] = cluster:role_list(leader),
+    MgrL = [Leader | cluster:role_list(master)],
+    MgrList = binary_to_list(json:encode(
+        [atom_to_binary(TmpNode, utf8) || TmpNode <- MgrL])),
+    Url = lists:concat(["http://", HostStr, "/api/v1/",
+        binary_to_list(?LEADER_SELECT), "/", AppId,
+        "?", binary_to_list(?LEADER), "=", Leader,
+        "&", binary_to_list(?MGR_LIST), "=", MgrList,
+        "&", binary_to_list(?MAX_MGR_NUM), "=", "7"
+    ]),
+    {ok, {_,_,Rsp}} = httpc:request(put, {Url, [], [], []}, [{timeout, 5000}], []),
+    RspMap = json:decode(list_to_binary(Rsp),[return_maps]),
+    io:format("leader_select_update = ~p~n", [RspMap]),
+    #{?ERR_CODE := 0} = RspMap,
+    ok.
 
 
 set_my_role(Role)->
@@ -308,7 +358,13 @@ set_my_role(Role)->
     ok.
 
 get_my_role()->
-    %cluster:node_role(node()).
     {ok, MyRole} = application:get_env(cluster, role),
     MyRole.
 
+set_masters(Masters) when is_list(Masters) ->
+    application:set_env(cluster, masters, Masters),
+    ok.
+
+get_masters() ->
+    Ret = {ok, _Masters} = application:get_env(cluster, masters),
+    Ret.
